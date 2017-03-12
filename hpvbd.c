@@ -9,6 +9,15 @@
 #include <linux/blk-mq.h>
 #include <linux/hrtimer.h>
 
+#define NULL_MINORS     (1U << MINORBITS)
+
+static struct class *null_class;
+
+static int null_char_major;
+module_param(null_char_major, int, 0);
+
+struct nullb;
+
 struct nullb_cmd {
 	struct list_head list;
 	struct llist_node ll_list;
@@ -26,6 +35,8 @@ struct nullb_queue {
 
 	struct nullb_cmd *cmds;
     struct device *device;  // char device
+    struct nullb *dev;
+    unsigned int index;
 };
 
 struct nullb {
@@ -82,7 +93,7 @@ static int queue_mode = NULL_Q_MQ;
 module_param(queue_mode, int, S_IRUGO);
 MODULE_PARM_DESC(queue_mode, "Block interface to use (0=bio,1=rq,2=multiqueue)");
 
-static int gb = 250;
+static int gb = 10;
 module_param(gb, int, S_IRUGO);
 MODULE_PARM_DESC(gb, "Size in GB");
 
@@ -90,7 +101,7 @@ static int bs = 512;
 module_param(bs, int, S_IRUGO);
 MODULE_PARM_DESC(bs, "Block size (in bytes)");
 
-static int nr_devices = 2;
+static int nr_devices = 1;
 module_param(nr_devices, int, S_IRUGO);
 MODULE_PARM_DESC(nr_devices, "Number of devices to register");
 
@@ -328,13 +339,24 @@ static int null_queue_rq(struct blk_mq_hw_ctx *hctx,
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
-static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq)
+static const struct attribute_group *null_dev_attr_groups[] = {
+    NULL,
+};
+
+static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq, unsigned int index)
 {
 	BUG_ON(!nullb);
 	BUG_ON(!nq);
 
 	init_waitqueue_head(&nq->wait);
 	nq->queue_depth = nullb->queue_depth;
+
+    nq->dev = nullb;
+    nq->index = index;
+    nq->device = device_create_with_groups(null_class, NULL,
+            MKDEV(null_char_major, (nullb->index << 8) | index),
+            nq, null_dev_attr_groups,
+            "nullb%dq%d", nullb->index, index);
 }
 
 static int null_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
@@ -344,7 +366,7 @@ static int null_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 	struct nullb_queue *nq = &nullb->queues[index];
 
 	hctx->driver_data = nq;
-	null_init_queue(nullb, nq);
+	null_init_queue(nullb, nq, index);
 	nullb->nr_queues++;
 
 	return 0;
@@ -357,9 +379,20 @@ static struct blk_mq_ops null_mq_ops = {
 	.complete	= null_softirq_done_fn,
 };
 
+static void null_deinit_queue(struct nullb *nullb, struct nullb_queue *nq)
+{
+    device_destroy(null_class, MKDEV(null_char_major, (nullb->index << 8) | nq->index));
+}
+
 static void null_del_dev(struct nullb *nullb)
 {
+    int i;
 	list_del_init(&nullb->list);
+
+	for (i = 0; i < nullb->nr_queues; i++) {
+		struct nullb_queue *nq = &nullb->queues[i];
+		null_deinit_queue(nullb, nq);
+    }
 
 	del_gendisk(nullb->disk);
 	blk_cleanup_queue(nullb->q);
@@ -447,7 +480,7 @@ static int init_driver_queues(struct nullb *nullb)
 	for (i = 0; i < submit_queues; i++) {
 		nq = &nullb->queues[i];
 
-		null_init_queue(nullb, nq);
+		null_init_queue(nullb, nq, (unsigned int)i);
 
 		ret = setup_commands(nq);
 		if (ret)
@@ -562,9 +595,34 @@ out:
 	return rv;
 }
 
+static int null_dev_open(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static int null_dev_release(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static long null_dev_ioctl(struct file *file, unsigned int cmd,
+                unsigned long arg)
+{
+    return 0;
+}
+
+static const struct file_operations null_dev_fops = {
+    .owner      = THIS_MODULE,
+    .open       = null_dev_open,
+    .release    = null_dev_release,
+    .unlocked_ioctl = null_dev_ioctl,
+    .compat_ioctl   = null_dev_ioctl,
+};
+
 static int __init null_init(void)
 {
 	unsigned int i;
+    int result;
 
 	if (bs > PAGE_SIZE) {
 		pr_warn("null_blk: invalid block size\n");
@@ -602,15 +660,34 @@ static int __init null_init(void)
 	if (null_major < 0)
 		return null_major;
 
+    result = __register_chrdev(null_char_major, 0, NULL_MINORS, "nullb",
+            &null_dev_fops);
+    if (result < 0)
+        goto unregister_blkdev;
+    else if (result > 0)
+        null_char_major = result;
+
+    null_class = class_create(THIS_MODULE, "nullb");
+    if (IS_ERR(null_class)) {
+        result = PTR_ERR(null_class);
+        goto unregister_chrdev;
+    }
+
 	for (i = 0; i < nr_devices; i++) {
 		if (null_add_dev()) {
-			unregister_blkdev(null_major, "nullb");
-			return -EINVAL;
+            result = -EINVAL;
+            goto unregister_chrdev;
 		}
 	}
 
 	pr_info("null: module loaded\n");
 	return 0;
+
+unregister_chrdev:
+    __unregister_chrdev(null_char_major, 0, NULL_MINORS, "nullb");
+unregister_blkdev:
+	unregister_blkdev(null_major, "nullb");
+    return result;
 }
 
 static void __exit null_exit(void)
@@ -625,6 +702,9 @@ static void __exit null_exit(void)
 		null_del_dev(nullb);
 	}
 	mutex_unlock(&lock);
+
+    class_destroy(null_class);
+    __unregister_chrdev(null_char_major, 0, NULL_MINORS, "nullb");
 }
 
 module_init(null_init);
