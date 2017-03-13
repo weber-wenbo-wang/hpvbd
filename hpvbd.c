@@ -10,6 +10,8 @@
 #include <linux/hrtimer.h>
 #include <linux/vmalloc.h>
 
+#include "shared_data.h"
+
 #define NULL_MINORS     (1U << MINORBITS)
 
 #define NULL_MK_MINOR(nullb_index, queue_index) \
@@ -43,10 +45,6 @@ struct nullb_cmd {
 	struct bio *bio;
 	unsigned int tag;
 	struct nullb_queue *nq;
-};
-
-struct shared_area {
-    char buf[8];
 };
 
 struct nullb_queue {
@@ -680,15 +678,43 @@ static struct vm_operations_struct null_vm_ops = {
     .close  = null_vm_close,
 };
 
+#define NULL_QUEUE_DEPTH        128
+static struct shared_area *create_shared_data(void)
+{
+    unsigned long len;
+    struct shared_area *sa;
+    null_user_request req;
+
+    len = sizeof(struct shared_area) + sizeof(null_user_request) * NULL_QUEUE_DEPTH;
+    len = PAGE_ALIGN(len);
+	pr_info("null: shared area len = %lu\n", len);
+
+    sa = vmalloc(len);
+    BUG_ON(sa == NULL);
+
+    sa->sa_size = len;
+    null_ring_buffer_init(&sa->sq, NULL_QUEUE_DEPTH, sizeof(null_user_request), sa->buffer);
+
+    // TODO: remove me
+    req.v = 10086;
+    null_ring_buffer_enqueue(&sa->sq, &req, 0);
+    req.v = 99999;
+    null_ring_buffer_enqueue(&sa->sq, &req, 0);
+    return sa;
+}
+
 static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
 {
     unsigned long len = vma->vm_end - vma->vm_start, offset, pfn;
-    char *mem = vmalloc(len);       // TODO: vmalloc free
+    char *mem;
     struct page *page;
     struct nullb_queue *nq = file->private_data;
 
     null_dbg(nq->dev, "vmalloc nq->sa\n");
-    nq->sa = (struct shared_area *)mem;
+    nq->sa = create_shared_data();
+    mem = (char *)nq->sa;
+
+    len = len > nq->sa->sa_size ? nq->sa->sa_size : len;
 
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
     vma->vm_ops = &null_vm_ops;
