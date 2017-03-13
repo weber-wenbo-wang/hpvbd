@@ -8,8 +8,25 @@
 #include <linux/slab.h>
 #include <linux/blk-mq.h>
 #include <linux/hrtimer.h>
+#include <linux/vmalloc.h>
 
 #define NULL_MINORS     (1U << MINORBITS)
+
+#define NULL_MK_MINOR(nullb_index, queue_index) \
+    ((nullb_index) << 8 | (queue_index))
+
+#define NULL_BLK_INDEX(minor)   \
+    ((minor) >> 8)
+#define NULL_QUEUE_INDEX(minor) \
+    ((minor) & 0xff)
+
+#define null_printk(level, dev, fmt, arg...) \
+        printk(level "nullb%d: " fmt, (dev)->index, ## arg)
+
+#define null_dbg(dev, fmt, arg...)            \
+    do {                                \
+        null_printk(KERN_DEBUG, dev, fmt , ## arg);     \
+    } while (0)
 
 static struct class *null_class;
 
@@ -28,6 +45,10 @@ struct nullb_cmd {
 	struct nullb_queue *nq;
 };
 
+struct shared_area {
+    char buf[8];
+};
+
 struct nullb_queue {
 	unsigned long *tag_map;
 	wait_queue_head_t wait;
@@ -37,6 +58,8 @@ struct nullb_queue {
     struct device *device;  // char device
     struct nullb *dev;
     unsigned int index;
+    int open_count;
+    struct shared_area *sa;
 };
 
 struct nullb {
@@ -354,7 +377,7 @@ static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq, unsigne
     nq->dev = nullb;
     nq->index = index;
     nq->device = device_create_with_groups(null_class, NULL,
-            MKDEV(null_char_major, (nullb->index << 8) | index),
+            MKDEV(null_char_major, NULL_MK_MINOR(nullb->index, index)),
             nq, null_dev_attr_groups,
             "nullb%dq%d", nullb->index, index);
 }
@@ -597,11 +620,39 @@ out:
 
 static int null_dev_open(struct inode *inode, struct file *file)
 {
-    return 0;
+    int index = NULL_BLK_INDEX(iminor(inode));
+    int queue_idx = NULL_QUEUE_INDEX(iminor(inode));
+    struct nullb *nullb;
+    struct nullb_queue *nq;
+    int ret = -ENODEV;
+
+	mutex_lock(&lock);
+    list_for_each_entry(nullb, &nullb_list, list) {
+        if (nullb->index != index)
+            continue;
+
+        /* TODO: check nullb kref and inc */
+        file->private_data = nq = &nullb->queues[queue_idx];
+        nq->open_count++;
+        ret = 0;
+        break;
+    }
+	mutex_unlock(&lock);
+    return ret;
 }
 
 static int null_dev_release(struct inode *inode, struct file *file)
 {
+    /* TODO: dec nullb->kref */
+    struct nullb_queue *nq = file->private_data;
+    if (--nq->open_count != 0)
+        return 0;
+
+    if (nq->sa) {
+        null_dbg(nq->dev, "vfree nq->sa\n");
+        vfree(nq->sa);
+        nq->sa = NULL;
+    }
     return 0;
 }
 
@@ -611,12 +662,58 @@ static long null_dev_ioctl(struct file *file, unsigned int cmd,
     return 0;
 }
 
+static void null_vm_open(struct vm_area_struct *vma)
+{
+    struct nullb_queue *nq = vma->vm_private_data;
+    null_dbg(nq->dev, "vm open\n");
+}
+
+static void null_vm_close(struct vm_area_struct *vma)
+{
+    struct nullb_queue *nq = vma->vm_private_data;
+    null_dbg(nq->dev, "vm close\n");
+}
+
+
+static struct vm_operations_struct null_vm_ops = {
+    .open   = null_vm_open,
+    .close  = null_vm_close,
+};
+
+static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    unsigned long len = vma->vm_end - vma->vm_start, offset, pfn;
+    char *mem = vmalloc(len);       // TODO: vmalloc free
+    struct page *page;
+    struct nullb_queue *nq = file->private_data;
+
+    null_dbg(nq->dev, "vmalloc nq->sa\n");
+    nq->sa = (struct shared_area *)mem;
+
+    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    vma->vm_ops = &null_vm_ops;
+    vma->vm_private_data = (void *)nq;
+
+    for (offset = 0; offset < len; offset += PAGE_SIZE) {
+        page = vmalloc_to_page(mem + offset);
+        get_page(page);
+        pfn = page_to_pfn(page);
+
+        if (remap_pfn_range(vma, vma->vm_start + offset, pfn, PAGE_SIZE,
+                        vma->vm_page_prot))
+            return -EAGAIN; // TODO
+    }
+
+    return 0;
+}
+
 static const struct file_operations null_dev_fops = {
     .owner      = THIS_MODULE,
     .open       = null_dev_open,
     .release    = null_dev_release,
     .unlocked_ioctl = null_dev_ioctl,
     .compat_ioctl   = null_dev_ioctl,
+    .mmap       = null_dev_mmap,
 };
 
 static int __init null_init(void)
@@ -705,6 +802,7 @@ static void __exit null_exit(void)
 
     class_destroy(null_class);
     __unregister_chrdev(null_char_major, 0, NULL_MINORS, "nullb");
+	pr_info("null: module unloaded\n");
 }
 
 module_init(null_init);
