@@ -58,6 +58,7 @@ struct nullb_queue {
     unsigned int index;
     int open_count;
     struct shared_area *sa;
+    struct blk_mq_tags **tags;
 };
 
 struct nullb {
@@ -266,6 +267,18 @@ static void null_softirq_done_fn(struct request *rq)
 		end_cmd(rq->special);
 }
 
+static void null_mq_handle_cmd(struct nullb_cmd *cmd)
+{
+    struct nullb_queue *nq = cmd->nq;
+    null_user_request req;
+
+    if (nq->sa) {       // TODO
+        req.tag = cmd->rq->tag;
+        null_ring_buffer_enqueue(&nq->sa->sq, &req, 0);
+    }
+	// blk_mq_complete_request(cmd->rq, cmd->rq->errors);
+}
+
 static inline void null_handle_cmd(struct nullb_cmd *cmd)
 {
 	/* Complete IO by inline, softirq or timer */
@@ -273,7 +286,7 @@ static inline void null_handle_cmd(struct nullb_cmd *cmd)
 	case NULL_IRQ_SOFTIRQ:
 		switch (queue_mode)  {
 		case NULL_Q_MQ:
-			blk_mq_complete_request(cmd->rq, cmd->rq->errors);
+            null_mq_handle_cmd(cmd);
 			break;
 		case NULL_Q_RQ:
 			blk_complete_request(cmd->rq);
@@ -364,6 +377,25 @@ static const struct attribute_group *null_dev_attr_groups[] = {
     NULL,
 };
 
+#define NULL_QUEUE_DEPTH        128
+static struct shared_area *create_shared_data(void)
+{
+    unsigned long len;
+    struct shared_area *sa;
+
+    len = sizeof(struct shared_area) + sizeof(null_user_request) * NULL_QUEUE_DEPTH;
+    len = PAGE_ALIGN(len);
+	pr_info("null: shared area len = %lu\n", len);
+
+    sa = vmalloc(len);
+    BUG_ON(sa == NULL);
+
+    sa->sa_size = len;
+    null_ring_buffer_init(&sa->sq, NULL_QUEUE_DEPTH, sizeof(null_user_request), sa->buffer);
+
+    return sa;
+}
+
 static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq, unsigned int index)
 {
 	BUG_ON(!nullb);
@@ -374,6 +406,10 @@ static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq, unsigne
 
     nq->dev = nullb;
     nq->index = index;
+
+    null_dbg(nq->dev, "vmalloc nq->sa\n");
+    nq->sa = create_shared_data();
+
     nq->device = device_create_with_groups(null_class, NULL,
             MKDEV(null_char_major, NULL_MK_MINOR(nullb->index, index)),
             nq, null_dev_attr_groups,
@@ -385,6 +421,10 @@ static int null_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 {
 	struct nullb *nullb = data;
 	struct nullb_queue *nq = &nullb->queues[index];
+
+    if (!nq->tags) {
+        nq->tags = &nullb->tag_set.tags[index];
+    }
 
 	hctx->driver_data = nq;
 	null_init_queue(nullb, nq, index);
@@ -402,6 +442,12 @@ static struct blk_mq_ops null_mq_ops = {
 
 static void null_deinit_queue(struct nullb *nullb, struct nullb_queue *nq)
 {
+    if (nq->sa) {
+        null_dbg(nq->dev, "vfree nq->sa\n");
+        vfree(nq->sa);
+        nq->sa = NULL;
+    }
+
     device_destroy(null_class, MKDEV(null_char_major, (nullb->index << 8) | nq->index));
 }
 
@@ -646,17 +692,36 @@ static int null_dev_release(struct inode *inode, struct file *file)
     if (--nq->open_count != 0)
         return 0;
 
-    if (nq->sa) {
-        null_dbg(nq->dev, "vfree nq->sa\n");
-        vfree(nq->sa);
-        nq->sa = NULL;
-    }
+    return 0;
+}
+
+
+static long null_handle_user_io_cmd(struct nullb_queue *nq, struct null_user_io __user *ucmd)
+{
+    struct null_user_io cmd;
+    struct request *req;
+
+    if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+        return -EFAULT;
+
+    null_dbg(nq->dev, "tag = %d\n", cmd.tag);
+
+    req = blk_mq_tag_to_rq(*nq->tags, cmd.tag);
+	blk_mq_complete_request(req, 0);
     return 0;
 }
 
 static long null_dev_ioctl(struct file *file, unsigned int cmd,
                 unsigned long arg)
 {
+    struct nullb_queue *nq = file->private_data;
+
+    switch (cmd) {
+    case NULL_IOCTL_IO_CMD:
+        return null_handle_user_io_cmd(nq, (struct null_user_io *)arg);
+    default:
+        return -ENOTTY;
+    }
     return 0;
 }
 
@@ -678,31 +743,6 @@ static struct vm_operations_struct null_vm_ops = {
     .close  = null_vm_close,
 };
 
-#define NULL_QUEUE_DEPTH        128
-static struct shared_area *create_shared_data(void)
-{
-    unsigned long len;
-    struct shared_area *sa;
-    null_user_request req;
-
-    len = sizeof(struct shared_area) + sizeof(null_user_request) * NULL_QUEUE_DEPTH;
-    len = PAGE_ALIGN(len);
-	pr_info("null: shared area len = %lu\n", len);
-
-    sa = vmalloc(len);
-    BUG_ON(sa == NULL);
-
-    sa->sa_size = len;
-    null_ring_buffer_init(&sa->sq, NULL_QUEUE_DEPTH, sizeof(null_user_request), sa->buffer);
-
-    // TODO: remove me
-    req.v = 10086;
-    null_ring_buffer_enqueue(&sa->sq, &req, 0);
-    req.v = 99999;
-    null_ring_buffer_enqueue(&sa->sq, &req, 0);
-    return sa;
-}
-
 static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
 {
     unsigned long len = vma->vm_end - vma->vm_start, offset, pfn;
@@ -710,10 +750,7 @@ static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
     struct page *page;
     struct nullb_queue *nq = file->private_data;
 
-    null_dbg(nq->dev, "vmalloc nq->sa\n");
-    nq->sa = create_shared_data();
     mem = (char *)nq->sa;
-
     len = len > nq->sa->sa_size ? nq->sa->sa_size : len;
 
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
