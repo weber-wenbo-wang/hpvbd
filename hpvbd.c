@@ -1,3 +1,14 @@
+/*
+ * High Performance Virtual Block Device driver
+ * Revised from null_blk.c
+ *
+ * TODO:
+ * 1. Add an inflight io list, so io can be resubmitted when userspace
+ *    server restarts.
+ * 2. Timeout handling.
+ * 3. Zero copy by revising /dev/mem or a new driver.
+ * 4. sysfs/configfs/ioctl to dynamically create/destroy/modify vdisks.
+ */
 #include <linux/module.h>
 
 #include <linux/moduleparam.h>
@@ -13,51 +24,60 @@
 
 #include "shared_data.h"
 
-#define NULL_MINORS     (1U << MINORBITS)
-#define NULL_QUEUE_DEPTH        16
+#define HPVBD_REQ_MAX_SECTORS    128
+#define HPVBD_MINORS     (1U << MINORBITS)
 
-#define NULL_MK_MINOR(nullb_index, queue_index) \
-    ((nullb_index) << 8 | (queue_index))
+#define HPVBD_MK_MINOR(hpvbd_index, queue_index) \
+    ((hpvbd_index) << 8 | (queue_index))
 
-#define NULL_BLK_INDEX(minor)   \
+#define HPVBD_BLK_INDEX(minor)   \
     ((minor) >> 8)
-#define NULL_QUEUE_INDEX(minor) \
+#define HPVBD_QUEUE_INDEX(minor) \
     ((minor) & 0xff)
 
-#define null_printk(level, dev, fmt, arg...) \
-        printk(level "nullb%d: " fmt, (dev)->index, ## arg)
-
-#define null_dbg(dev, fmt, arg...)            \
-    do {                                \
-        null_printk(KERN_DEBUG, dev, fmt , ## arg);     \
+#define hpvbd_printk(level, dev, fmt, arg...) \
+    do {    \
+        printk(level "hpvbd%d: " fmt, (dev)->index, ## arg); \
     } while (0)
 
-static struct class *null_class;
+#define hpvbd_info(dev, fmt, arg...)            \
+    do {                                \
+        if (true) \
+            hpvbd_printk(KERN_INFO, dev, fmt , ## arg);     \
+    } while (0)
 
-static int null_char_major;
-module_param(null_char_major, int, 0);
+#define hpvbd_dbg(dev, fmt, arg...)            \
+    do {                                \
+        if (false) \
+            hpvbd_printk(KERN_DEBUG, dev, fmt , ## arg);     \
+    } while (0)
 
-struct nullb;
+static struct class *hpvbd_class;
 
-struct nullb_cmd {
+static int hpvbd_char_major;
+module_param(hpvbd_char_major, int, 0);
+
+struct hpvbd;
+
+struct hpvbd_cmd {
 	struct list_head list;
 	struct llist_node ll_list;
 	struct call_single_data csd;
 	struct request *rq;
 	struct bio *bio;
 	unsigned int tag;
-	struct nullb_queue *nq;
-    struct null_user_request cmd;
+	struct hpvbd_queue *nq;
+    struct hpvbd_user_request cmd;
 };
 
-struct nullb_queue {
+struct hpvbd_queue {
 	unsigned long *tag_map;
 	wait_queue_head_t wait;
 	unsigned int queue_depth;
 
-	struct nullb_cmd *cmds;
+	struct hpvbd_cmd *cmds;
     struct device *device;  // char device
-    struct nullb *dev;
+    struct hpvbd *dev;
     unsigned int index;
     int open_count;
     struct shared_area *sa;
@@ -66,7 +86,7 @@ struct nullb_queue {
     wait_queue_head_t poll_wait;
 };
 
-struct nullb {
+struct hpvbd {
 	struct list_head list;
 	unsigned int index;
 	struct request_queue *q;
@@ -76,14 +96,15 @@ struct nullb {
 	unsigned int queue_depth;
 	spinlock_t lock;
 
-	struct nullb_queue *queues;
+	struct hpvbd_queue *queues;
 	unsigned int nr_queues;
+    sector_t size;
 };
 
-static LIST_HEAD(nullb_list);
+static LIST_HEAD(hpvbd_list);
 static struct mutex lock;
-static int null_major;
-static int nullb_indexes;
+static int hpvbd_major;
+static int hpvbd_indexes;
 
 struct completion_queue {
 	struct llist_head list;
@@ -97,15 +118,15 @@ struct completion_queue {
 static DEFINE_PER_CPU(struct completion_queue, completion_queues);
 
 enum {
-	NULL_IRQ_NONE		= 0,
-	NULL_IRQ_SOFTIRQ	= 1,
-	NULL_IRQ_TIMER		= 2,
+	HPVBD_IRQ_NONE		= 0,
+	HPVBD_IRQ_SOFTIRQ	= 1,
+	HPVBD_IRQ_TIMER		= 2,
 };
 
 enum {
-	NULL_Q_BIO		= 0,
-	NULL_Q_RQ		= 1,
-	NULL_Q_MQ		= 2,
+	HPVBD_Q_BIO		= 0,
+	HPVBD_Q_RQ		= 1,
+	HPVBD_Q_MQ		= 2,
 };
 
 static int submit_queues;
@@ -116,7 +137,7 @@ static int home_node = NUMA_NO_NODE;
 module_param(home_node, int, S_IRUGO);
 MODULE_PARM_DESC(home_node, "Home node for the device");
 
-static int queue_mode = NULL_Q_MQ;
+static int queue_mode = HPVBD_Q_MQ;
 module_param(queue_mode, int, S_IRUGO);
 MODULE_PARM_DESC(queue_mode, "Block interface to use (0=bio,1=rq,2=multiqueue)");
 
@@ -132,7 +153,7 @@ static int nr_devices = 1;
 module_param(nr_devices, int, S_IRUGO);
 MODULE_PARM_DESC(nr_devices, "Number of devices to register");
 
-static int irqmode = NULL_IRQ_SOFTIRQ;
+static int irqmode = HPVBD_IRQ_SOFTIRQ;
 module_param(irqmode, int, S_IRUGO);
 MODULE_PARM_DESC(irqmode, "IRQ completion handler. 0-none, 1-softirq, 2-timer");
 
@@ -140,7 +161,7 @@ static int completion_nsec = 10000;
 module_param(completion_nsec, int, S_IRUGO);
 MODULE_PARM_DESC(completion_nsec, "Time in ns to complete a request in hardware. Default: 10,000ns");
 
-static int hw_queue_depth = NULL_QUEUE_DEPTH;
+static int hw_queue_depth = 16;
 module_param(hw_queue_depth, int, S_IRUGO);
 MODULE_PARM_DESC(hw_queue_depth, "Queue depth for each hardware queue. Default: 64");
 
@@ -148,7 +169,7 @@ static bool use_per_node_hctx = false;
 module_param(use_per_node_hctx, bool, S_IRUGO);
 MODULE_PARM_DESC(use_per_node_hctx, "Use per-node allocation for hardware context queues. Default: false");
 
-static void put_tag(struct nullb_queue *nq, unsigned int tag)
+static void put_tag(struct hpvbd_queue *nq, unsigned int tag)
 {
 	clear_bit_unlock(tag, nq->tag_map);
 
@@ -156,7 +177,7 @@ static void put_tag(struct nullb_queue *nq, unsigned int tag)
 		wake_up(&nq->wait);
 }
 
-static unsigned int get_tag(struct nullb_queue *nq)
+static unsigned int get_tag(struct hpvbd_queue *nq)
 {
 	unsigned int tag;
 
@@ -169,14 +190,14 @@ static unsigned int get_tag(struct nullb_queue *nq)
 	return tag;
 }
 
-static void free_cmd(struct nullb_cmd *cmd)
+static void free_cmd(struct hpvbd_cmd *cmd)
 {
 	put_tag(cmd->nq, cmd->tag);
 }
 
-static struct nullb_cmd *__alloc_cmd(struct nullb_queue *nq)
+static struct hpvbd_cmd *__alloc_cmd(struct hpvbd_queue *nq)
 {
-	struct nullb_cmd *cmd;
+	struct hpvbd_cmd *cmd;
 	unsigned int tag;
 
 	tag = get_tag(nq);
@@ -190,9 +211,9 @@ static struct nullb_cmd *__alloc_cmd(struct nullb_queue *nq)
 	return NULL;
 }
 
-static struct nullb_cmd *alloc_cmd(struct nullb_queue *nq, int can_wait)
+static struct hpvbd_cmd *alloc_cmd(struct hpvbd_queue *nq, int can_wait)
 {
-	struct nullb_cmd *cmd;
+	struct hpvbd_cmd *cmd;
 	DEFINE_WAIT(wait);
 
 	cmd = __alloc_cmd(nq);
@@ -212,17 +233,17 @@ static struct nullb_cmd *alloc_cmd(struct nullb_queue *nq, int can_wait)
 	return cmd;
 }
 
-static void end_cmd(struct nullb_cmd *cmd)
+static void end_cmd(struct hpvbd_cmd *cmd)
 {
 	switch (queue_mode)  {
-	case NULL_Q_MQ:
+	case HPVBD_Q_MQ:
 		blk_mq_end_request(cmd->rq, 0);
 		return;
-	case NULL_Q_RQ:
+	case HPVBD_Q_RQ:
 		INIT_LIST_HEAD(&cmd->rq->queuelist);
 		blk_end_request_all(cmd->rq, 0);
 		break;
-	case NULL_Q_BIO:
+	case HPVBD_Q_BIO:
 		bio_endio(cmd->bio, 0);
 		break;
 	}
@@ -230,18 +251,18 @@ static void end_cmd(struct nullb_cmd *cmd)
 	free_cmd(cmd);
 }
 
-static enum hrtimer_restart null_cmd_timer_expired(struct hrtimer *timer)
+static enum hrtimer_restart hpvbd_cmd_timer_expired(struct hrtimer *timer)
 {
 	struct completion_queue *cq;
 	struct llist_node *entry;
-	struct nullb_cmd *cmd;
+	struct hpvbd_cmd *cmd;
 
 	cq = &per_cpu(completion_queues, smp_processor_id());
 
 	while ((entry = llist_del_all(&cq->list)) != NULL) {
 		entry = llist_reverse_order(entry);
 		do {
-			cmd = container_of(entry, struct nullb_cmd, ll_list);
+			cmd = container_of(entry, struct hpvbd_cmd, ll_list);
 			entry = entry->next;
 			end_cmd(cmd);
 		} while (entry);
@@ -250,7 +271,7 @@ static enum hrtimer_restart null_cmd_timer_expired(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
-static void null_cmd_end_timer(struct nullb_cmd *cmd)
+static void hpvbd_cmd_end_timer(struct hpvbd_cmd *cmd)
 {
 	struct completion_queue *cq = &per_cpu(completion_queues, get_cpu());
 
@@ -264,9 +285,9 @@ static void null_cmd_end_timer(struct nullb_cmd *cmd)
 	put_cpu();
 }
 
-static void null_softirq_done_fn(struct request *rq)
+static void hpvbd_softirq_done_fn(struct request *rq)
 {
-	if (queue_mode == NULL_Q_MQ)
+	if (queue_mode == HPVBD_Q_MQ)
 		end_cmd(blk_mq_rq_to_pdu(rq));
 	else
 		end_cmd(rq->special);
@@ -275,14 +296,14 @@ static void null_softirq_done_fn(struct request *rq)
 static void *alloc_user_buffer(struct shared_area *sa, unsigned int tag, unsigned int len)
 {
     char *buffer;
-    BUG_ON(tag >= NULL_QUEUE_DEPTH);
-    BUG_ON(len > (NULL_REQ_MAX_SECTORS << 9));
+    BUG_ON(tag >= hw_queue_depth);
+    BUG_ON(len > (HPVBD_REQ_MAX_SECTORS << 9));
 
-    buffer = (char *)(sa->buffer + sa->databuf_off + tag * (NULL_REQ_MAX_SECTORS << 9));
+    buffer = (char *)(sa->buffer + sa->databuf_off + tag * (HPVBD_REQ_MAX_SECTORS << 9));
     return buffer;
 }
 
-static void copy_to_user_buffer(struct nullb_queue *nq, struct request *req, struct null_user_request *cmnd)
+static void copy_to_user_buffer(struct hpvbd_queue *nq, struct request *req, struct hpvbd_user_request *cmnd)
 {
     struct bio_vec *bvec;
     struct req_iterator iter;
@@ -301,7 +322,7 @@ static void copy_to_user_buffer(struct nullb_queue *nq, struct request *req, str
     cmnd->rw.buf_off = (char *)dst - nq->sa->buffer;
 }
 
-static void copy_from_user_buffer(struct nullb_queue *nq, struct request *req, struct null_user_request *cmnd)
+static void copy_from_user_buffer(struct hpvbd_queue *nq, struct request *req, struct hpvbd_user_request *cmnd)
 {
     struct bio_vec *bvec;
     struct req_iterator iter;
@@ -318,12 +339,12 @@ static void copy_from_user_buffer(struct nullb_queue *nq, struct request *req, s
     }
 }
 
-static void null_init_user_cmd(struct nullb_queue *nq, struct nullb_cmd *iod, struct null_user_request *cmnd)
+static void hpvbd_init_user_cmd(struct hpvbd_queue *nq, struct hpvbd_cmd *iod, struct hpvbd_user_request *cmnd)
 {
     struct request *req = iod->rq;
 
     memset(cmnd, 0, sizeof(*cmnd));
-    cmnd->rw.opcode = (rq_data_dir(req) ? null_cmd_write : null_cmd_read);
+    cmnd->rw.opcode = (rq_data_dir(req) ? hpvbd_cmd_write : hpvbd_cmd_read);
     cmnd->rw.tag = req->tag;
     cmnd->rw.slba = blk_rq_pos(req);
     cmnd->rw.length = blk_rq_bytes(req);
@@ -339,12 +360,12 @@ static void null_init_user_cmd(struct nullb_queue *nq, struct nullb_cmd *iod, st
 
         i = 0;
         rq_for_each_segment(bvec, req, iter) {
-            struct null_iovec *nvec = &cmnd->rw.iovec[i++];
+            struct hpvbd_iovec *nvec = &cmnd->rw.iovec[i++];
             nvec->phys_addr = page_to_phys(bvec->bv_page) + bvec->bv_offset;
             nvec->len = bvec->bv_len;
 
-            if (i >= NULL_REQ_MAX_SEGMENTS) {
-                null_dbg(nq->dev, "request exceeds max segments");
+            if (i >= HPVBD_REQ_MAX_SEGMENTS) {
+                hpvbd_dbg(nq->dev, "request exceeds max segments");
                 break;
             }
         }
@@ -352,39 +373,39 @@ static void null_init_user_cmd(struct nullb_queue *nq, struct nullb_cmd *iod, st
     }
     */
 
-    if (cmnd->rw.opcode == null_cmd_write) {
+    if (cmnd->rw.opcode == hpvbd_cmd_write) {
         copy_to_user_buffer(nq, req, cmnd);
-    } else if (cmnd->rw.opcode == null_cmd_read) {
+    } else if (cmnd->rw.opcode == hpvbd_cmd_read) {
         void *dst = alloc_user_buffer(nq->sa, req->tag, blk_rq_bytes(req));
         cmnd->rw.buf_off = (char *)dst - nq->sa->buffer;
     }
 }
 
-static inline void notify_user_new_reqeust(struct nullb_queue *nq)
+static inline void notify_user_new_reqeust(struct hpvbd_queue *nq)
 {
     wake_up_interruptible(&nq->poll_wait);
 }
 
-static int null_mq_handle_cmd(struct nullb_cmd *cmd)
+static int hpvbd_mq_handle_cmd(struct hpvbd_cmd *cmd)
 {
     int rc;
-    struct nullb_queue *nq = cmd->nq;
+    struct hpvbd_queue *nq = cmd->nq;
 
     if (cmd->rq->cmd_flags & REQ_DISCARD) {
 	    blk_mq_complete_request(cmd->rq, 0);
         return BLK_MQ_RQ_QUEUE_OK;
     }
 
-    null_init_user_cmd(nq, cmd, &cmd->cmd);
+    hpvbd_init_user_cmd(nq, cmd, &cmd->cmd);
 
-    null_dbg(nq->dev, "enqueue tag = %d, opcode = %d\n", cmd->rq->tag, cmd->cmd.rw.opcode);
+    hpvbd_dbg(nq->dev, "enqueue tag = %d, opcode = %d\n", cmd->rq->tag, cmd->cmd.rw.opcode);
 
     spin_lock_irq(&nq->q_lock);
-    rc = null_ring_buffer_enqueue(&nq->sa->sq, &cmd->cmd, 0);
+    rc = hpvbd_ring_buffer_enqueue(&nq->sa->sq, &cmd->cmd, 0);
     spin_unlock_irq(&nq->q_lock);
 
     if (rc != 0) {
-        null_dbg(nq->dev, "enqueue failed, queue busy\n");
+        hpvbd_dbg(nq->dev, "enqueue failed, queue busy\n");
         return BLK_MQ_RQ_QUEUE_BUSY;
     }
 
@@ -392,21 +413,21 @@ static int null_mq_handle_cmd(struct nullb_cmd *cmd)
     return BLK_MQ_RQ_QUEUE_OK;
 }
 
-static inline int null_handle_cmd(struct nullb_cmd *cmd)
+static inline int hpvbd_handle_cmd(struct hpvbd_cmd *cmd)
 {
     int rc = BLK_MQ_RQ_QUEUE_OK;
 
 	/* Complete IO by inline, softirq or timer */
 	switch (irqmode) {
-	case NULL_IRQ_SOFTIRQ:
+	case HPVBD_IRQ_SOFTIRQ:
 		switch (queue_mode)  {
-		case NULL_Q_MQ:
-            rc = null_mq_handle_cmd(cmd);
+		case HPVBD_Q_MQ:
+            rc = hpvbd_mq_handle_cmd(cmd);
 			break;
-		case NULL_Q_RQ:
+		case HPVBD_Q_RQ:
 			blk_complete_request(cmd->rq);
 			break;
-		case NULL_Q_BIO:
+		case HPVBD_Q_BIO:
 			/*
 			 * XXX: no proper submitting cpu information available.
 			 */
@@ -414,44 +435,44 @@ static inline int null_handle_cmd(struct nullb_cmd *cmd)
 			break;
 		}
 		break;
-	case NULL_IRQ_NONE:
+	case HPVBD_IRQ_NONE:
 		end_cmd(cmd);
 		break;
-	case NULL_IRQ_TIMER:
-		null_cmd_end_timer(cmd);
+	case HPVBD_IRQ_TIMER:
+		hpvbd_cmd_end_timer(cmd);
 		break;
 	}
 
     return rc;
 }
 
-static struct nullb_queue *nullb_to_queue(struct nullb *nullb)
+static struct hpvbd_queue *hpvbd_to_queue(struct hpvbd *hpvbd)
 {
 	int index = 0;
 
-	if (nullb->nr_queues != 1)
-		index = raw_smp_processor_id() / ((nr_cpu_ids + nullb->nr_queues - 1) / nullb->nr_queues);
+	if (hpvbd->nr_queues != 1)
+		index = raw_smp_processor_id() / ((nr_cpu_ids + hpvbd->nr_queues - 1) / hpvbd->nr_queues);
 
-	return &nullb->queues[index];
+	return &hpvbd->queues[index];
 }
 
-static void null_queue_bio(struct request_queue *q, struct bio *bio)
+static void hpvbd_queue_bio(struct request_queue *q, struct bio *bio)
 {
-	struct nullb *nullb = q->queuedata;
-	struct nullb_queue *nq = nullb_to_queue(nullb);
-	struct nullb_cmd *cmd;
+	struct hpvbd *hpvbd = q->queuedata;
+	struct hpvbd_queue *nq = hpvbd_to_queue(hpvbd);
+	struct hpvbd_cmd *cmd;
 
 	cmd = alloc_cmd(nq, 1);
 	cmd->bio = bio;
 
-	null_handle_cmd(cmd);
+	hpvbd_handle_cmd(cmd);
 }
 
-static int null_rq_prep_fn(struct request_queue *q, struct request *req)
+static int hpvbd_rq_prep_fn(struct request_queue *q, struct request *req)
 {
-	struct nullb *nullb = q->queuedata;
-	struct nullb_queue *nq = nullb_to_queue(nullb);
-	struct nullb_cmd *cmd;
+	struct hpvbd *hpvbd = q->queuedata;
+	struct hpvbd_queue *nq = hpvbd_to_queue(hpvbd);
+	struct hpvbd_cmd *cmd;
 
 	cmd = alloc_cmd(nq, 0);
 	if (cmd) {
@@ -463,33 +484,33 @@ static int null_rq_prep_fn(struct request_queue *q, struct request *req)
 	return BLKPREP_DEFER;
 }
 
-static void null_request_fn(struct request_queue *q)
+static void hpvbd_request_fn(struct request_queue *q)
 {
 	struct request *rq;
 
 	while ((rq = blk_fetch_request(q)) != NULL) {
-		struct nullb_cmd *cmd = rq->special;
+		struct hpvbd_cmd *cmd = rq->special;
 
 		spin_unlock_irq(q->queue_lock);
-		null_handle_cmd(cmd);
+		hpvbd_handle_cmd(cmd);
 		spin_lock_irq(q->queue_lock);
 	}
 }
 
-static int null_queue_rq(struct blk_mq_hw_ctx *hctx,
+static int hpvbd_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 const struct blk_mq_queue_data *bd)
 {
-	struct nullb_cmd *cmd = blk_mq_rq_to_pdu(bd->rq);
+	struct hpvbd_cmd *cmd = blk_mq_rq_to_pdu(bd->rq);
 
 	cmd->rq = bd->rq;
 	cmd->nq = hctx->driver_data;
 
 	blk_mq_start_request(bd->rq);
 
-	return null_handle_cmd(cmd);
+	return hpvbd_handle_cmd(cmd);
 }
 
-static const struct attribute_group *null_dev_attr_groups[] = {
+static const struct attribute_group *hpvbd_queue_attr_groups[] = {
     NULL,
 };
 
@@ -499,115 +520,115 @@ static struct shared_area *create_shared_data(void)
     struct shared_area *sa;
     unsigned long ring_buffer_size;
 
-    ring_buffer_size = null_ring_buffer_size_needed(NULL_QUEUE_DEPTH, sizeof(struct null_user_request));
+    ring_buffer_size = hpvbd_ring_buffer_size_needed(hw_queue_depth, sizeof(struct hpvbd_user_request));
 
-    len = sizeof(struct shared_area) + ring_buffer_size + (NULL_REQ_MAX_SECTORS << 9) * NULL_QUEUE_DEPTH;
+    len = sizeof(struct shared_area) + ring_buffer_size + (HPVBD_REQ_MAX_SECTORS << 9) * hw_queue_depth;
     len = PAGE_ALIGN(len);
-	pr_info("null: shared area len = %lu\n", len);
+	pr_info("hpvbd: shared area len = %lu\n", len);
 
     sa = vmalloc(len);
     BUG_ON(sa == NULL);
     sa->sa_size = len;
 
-    null_ring_buffer_init(&sa->sq, NULL_QUEUE_DEPTH, sizeof(struct null_user_request), sa->buffer);
+    hpvbd_ring_buffer_init(&sa->sq, hw_queue_depth, sizeof(struct hpvbd_user_request), sa->buffer);
     sa->databuf_off = ring_buffer_size;
 
     return sa;
 }
 
-static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq, unsigned int index)
+static void hpvbd_init_queue(struct hpvbd *hpvbd, struct hpvbd_queue *nq, unsigned int index)
 {
-	BUG_ON(!nullb);
+	BUG_ON(!hpvbd);
 	BUG_ON(!nq);
 
 	init_waitqueue_head(&nq->wait);
-	nq->queue_depth = nullb->queue_depth;
+	nq->queue_depth = hpvbd->queue_depth;
 
-    nq->dev = nullb;
+    nq->dev = hpvbd;
     nq->index = index;
     spin_lock_init(&nq->q_lock);
     init_waitqueue_head(&nq->poll_wait);
 
-    null_dbg(nq->dev, "vmalloc nq->sa\n");
+    hpvbd_info(nq->dev, "vmalloc nq->sa\n");
     nq->sa = create_shared_data();
 
-    nq->device = device_create_with_groups(null_class, NULL,
-            MKDEV(null_char_major, NULL_MK_MINOR(nullb->index, index)),
-            nq, null_dev_attr_groups,
-            "nullb%dq%d", nullb->index, index);
+    nq->device = device_create_with_groups(hpvbd_class, NULL,
+            MKDEV(hpvbd_char_major, HPVBD_MK_MINOR(hpvbd->index, index)),
+            nq, hpvbd_queue_attr_groups,
+            "hpvbd%dq%d", hpvbd->index, index);
 }
 
-static int null_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
+static int hpvbd_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 			  unsigned int index)
 {
-	struct nullb *nullb = data;
-	struct nullb_queue *nq = &nullb->queues[index];
+	struct hpvbd *hpvbd = data;
+	struct hpvbd_queue *nq = &hpvbd->queues[index];
 
     if (!nq->tags) {
-        nq->tags = &nullb->tag_set.tags[index];
+        nq->tags = &hpvbd->tag_set.tags[index];
     }
 
 	hctx->driver_data = nq;
-	null_init_queue(nullb, nq, index);
-	nullb->nr_queues++;
+	hpvbd_init_queue(hpvbd, nq, index);
+	hpvbd->nr_queues++;
 
 	return 0;
 }
 
-static struct blk_mq_ops null_mq_ops = {
-	.queue_rq       = null_queue_rq,
+static struct blk_mq_ops hpvbd_mq_ops = {
+	.queue_rq       = hpvbd_queue_rq,
 	.map_queue      = blk_mq_map_queue,
-	.init_hctx	= null_init_hctx,
-	.complete	= null_softirq_done_fn,
+	.init_hctx	= hpvbd_init_hctx,
+	.complete	= hpvbd_softirq_done_fn,
 };
 
-static void null_deinit_queue(struct nullb *nullb, struct nullb_queue *nq)
+static void hpvbd_deinit_queue(struct hpvbd *hpvbd, struct hpvbd_queue *nq)
 {
     if (nq->sa) {
-        null_dbg(nq->dev, "vfree nq->sa\n");
+        hpvbd_info(nq->dev, "vfree nq->sa\n");
         vfree(nq->sa);
         nq->sa = NULL;
     }
 
-    device_destroy(null_class, MKDEV(null_char_major, (nullb->index << 8) | nq->index));
+    device_destroy(hpvbd_class, MKDEV(hpvbd_char_major, (hpvbd->index << 8) | nq->index));
 }
 
-static void null_del_dev(struct nullb *nullb)
+static void hpvbd_del_dev(struct hpvbd *hpvbd)
 {
     int i;
-	list_del_init(&nullb->list);
+	list_del_init(&hpvbd->list);
 
-	for (i = 0; i < nullb->nr_queues; i++) {
-		struct nullb_queue *nq = &nullb->queues[i];
-		null_deinit_queue(nullb, nq);
+	for (i = 0; i < hpvbd->nr_queues; i++) {
+		struct hpvbd_queue *nq = &hpvbd->queues[i];
+		hpvbd_deinit_queue(hpvbd, nq);
     }
 
-	del_gendisk(nullb->disk);
-	blk_cleanup_queue(nullb->q);
-	if (queue_mode == NULL_Q_MQ)
-		blk_mq_free_tag_set(&nullb->tag_set);
-	put_disk(nullb->disk);
-	kfree(nullb);
+	del_gendisk(hpvbd->disk);
+	blk_cleanup_queue(hpvbd->q);
+	if (queue_mode == HPVBD_Q_MQ)
+		blk_mq_free_tag_set(&hpvbd->tag_set);
+	put_disk(hpvbd->disk);
+	kfree(hpvbd);
 }
 
-static int null_open(struct block_device *bdev, fmode_t mode)
+static int hpvbd_open(struct block_device *bdev, fmode_t mode)
 {
 	return 0;
 }
 
-static void null_release(struct gendisk *disk, fmode_t mode)
+static void hpvbd_release(struct gendisk *disk, fmode_t mode)
 {
 }
 
-static const struct block_device_operations null_fops = {
+static const struct block_device_operations hpvbd_fops = {
 	.owner =	THIS_MODULE,
-	.open =		null_open,
-	.release =	null_release,
+	.open =		hpvbd_open,
+	.release =	hpvbd_release,
 };
 
-static int setup_commands(struct nullb_queue *nq)
+static int setup_commands(struct hpvbd_queue *nq)
 {
-	struct nullb_cmd *cmd;
+	struct hpvbd_cmd *cmd;
 	int i, tag_size;
 
 	nq->cmds = kzalloc(nq->queue_depth * sizeof(*cmd), GFP_KERNEL);
@@ -631,175 +652,177 @@ static int setup_commands(struct nullb_queue *nq)
 	return 0;
 }
 
-static void cleanup_queue(struct nullb_queue *nq)
+static void cleanup_queue(struct hpvbd_queue *nq)
 {
 	kfree(nq->tag_map);
 	kfree(nq->cmds);
 }
 
-static void cleanup_queues(struct nullb *nullb)
+static void cleanup_queues(struct hpvbd *hpvbd)
 {
 	int i;
 
-	for (i = 0; i < nullb->nr_queues; i++)
-		cleanup_queue(&nullb->queues[i]);
+	for (i = 0; i < hpvbd->nr_queues; i++)
+		cleanup_queue(&hpvbd->queues[i]);
 
-	kfree(nullb->queues);
+	kfree(hpvbd->queues);
 }
 
-static int setup_queues(struct nullb *nullb)
+static int setup_queues(struct hpvbd *hpvbd)
 {
-	nullb->queues = kzalloc(submit_queues * sizeof(struct nullb_queue),
+	hpvbd->queues = kzalloc(submit_queues * sizeof(struct hpvbd_queue),
 								GFP_KERNEL);
-	if (!nullb->queues)
+	if (!hpvbd->queues)
 		return -ENOMEM;
 
-	nullb->nr_queues = 0;
-	nullb->queue_depth = hw_queue_depth;
+	hpvbd->nr_queues = 0;
+	hpvbd->queue_depth = hw_queue_depth;
 
 	return 0;
 }
 
-static int init_driver_queues(struct nullb *nullb)
+static int init_driver_queues(struct hpvbd *hpvbd)
 {
-	struct nullb_queue *nq;
+	struct hpvbd_queue *nq;
 	int i, ret = 0;
 
 	for (i = 0; i < submit_queues; i++) {
-		nq = &nullb->queues[i];
+		nq = &hpvbd->queues[i];
 
-		null_init_queue(nullb, nq, (unsigned int)i);
+		hpvbd_init_queue(hpvbd, nq, (unsigned int)i);
 
 		ret = setup_commands(nq);
 		if (ret)
 			goto err_queue;
-		nullb->nr_queues++;
+		hpvbd->nr_queues++;
 	}
 
 	return 0;
 err_queue:
-	cleanup_queues(nullb);
+	cleanup_queues(hpvbd);
 	return ret;
 }
 
-static int null_add_dev(void)
+static int hpvbd_add_dev(void)
 {
 	struct gendisk *disk;
-	struct nullb *nullb;
+	struct hpvbd *hpvbd;
 	sector_t size;
 	int rv;
 
-	nullb = kzalloc_node(sizeof(*nullb), GFP_KERNEL, home_node);
-	if (!nullb) {
+	hpvbd = kzalloc_node(sizeof(*hpvbd), GFP_KERNEL, home_node);
+	if (!hpvbd) {
 		rv = -ENOMEM;
 		goto out;
 	}
 
-	spin_lock_init(&nullb->lock);
+	spin_lock_init(&hpvbd->lock);
 
-	rv = setup_queues(nullb);
+	rv = setup_queues(hpvbd);
 	if (rv)
-		goto out_free_nullb;
+		goto out_free_hpvbd;
 
-	if (queue_mode == NULL_Q_MQ) {
-		nullb->tag_set.ops = &null_mq_ops;
-		nullb->tag_set.nr_hw_queues = submit_queues;
-		nullb->tag_set.queue_depth = hw_queue_depth;
-		nullb->tag_set.numa_node = home_node;
-		nullb->tag_set.cmd_size	= sizeof(struct nullb_cmd);
-		nullb->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
-		nullb->tag_set.driver_data = nullb;
+	if (queue_mode == HPVBD_Q_MQ) {
+		hpvbd->tag_set.ops = &hpvbd_mq_ops;
+		hpvbd->tag_set.nr_hw_queues = submit_queues;
+		hpvbd->tag_set.queue_depth = hw_queue_depth;
+		hpvbd->tag_set.numa_node = home_node;
+		hpvbd->tag_set.cmd_size	= sizeof(struct hpvbd_cmd);
+		hpvbd->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+		hpvbd->tag_set.driver_data = hpvbd;
 
-		rv = blk_mq_alloc_tag_set(&nullb->tag_set);
+		rv = blk_mq_alloc_tag_set(&hpvbd->tag_set);
 		if (rv)
 			goto out_cleanup_queues;
 
-		nullb->q = blk_mq_init_queue(&nullb->tag_set);
-		if (!nullb->q) {
+		hpvbd->q = blk_mq_init_queue(&hpvbd->tag_set);
+		if (!hpvbd->q) {
 			rv = -ENOMEM;
 			goto out_cleanup_tags;
 		}
-	} else if (queue_mode == NULL_Q_BIO) {
-		nullb->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
-		if (!nullb->q) {
+	} else if (queue_mode == HPVBD_Q_BIO) {
+		hpvbd->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
+		if (!hpvbd->q) {
 			rv = -ENOMEM;
 			goto out_cleanup_queues;
 		}
-		blk_queue_make_request(nullb->q, null_queue_bio);
-		init_driver_queues(nullb);
+		blk_queue_make_request(hpvbd->q, hpvbd_queue_bio);
+		init_driver_queues(hpvbd);
 	} else {
-		nullb->q = blk_init_queue_node(null_request_fn, &nullb->lock, home_node);
-		if (!nullb->q) {
+		hpvbd->q = blk_init_queue_node(hpvbd_request_fn, &hpvbd->lock, home_node);
+		if (!hpvbd->q) {
 			rv = -ENOMEM;
 			goto out_cleanup_queues;
 		}
-		blk_queue_prep_rq(nullb->q, null_rq_prep_fn);
-		blk_queue_softirq_done(nullb->q, null_softirq_done_fn);
-		init_driver_queues(nullb);
+		blk_queue_prep_rq(hpvbd->q, hpvbd_rq_prep_fn);
+		blk_queue_softirq_done(hpvbd->q, hpvbd_softirq_done_fn);
+		init_driver_queues(hpvbd);
 	}
 
-	nullb->q->queuedata = nullb;
-	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, nullb->q);
-	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, nullb->q);
+	hpvbd->q->queuedata = hpvbd;
+	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, hpvbd->q);
+	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, hpvbd->q);
 
-	disk = nullb->disk = alloc_disk_node(1, home_node);
+	disk = hpvbd->disk = alloc_disk_node(1, home_node);
 	if (!disk) {
 		rv = -ENOMEM;
 		goto out_cleanup_blk_queue;
 	}
 
 	mutex_lock(&lock);
-	list_add_tail(&nullb->list, &nullb_list);
-	nullb->index = nullb_indexes++;
+	list_add_tail(&hpvbd->list, &hpvbd_list);
+	hpvbd->index = hpvbd_indexes++;
 	mutex_unlock(&lock);
 
-	blk_queue_logical_block_size(nullb->q, bs);
-	blk_queue_physical_block_size(nullb->q, bs);
-	blk_queue_max_segments(nullb->q, NULL_REQ_MAX_SEGMENTS);
-    blk_queue_max_hw_sectors(nullb->q, NULL_REQ_MAX_SECTORS);
+	blk_queue_logical_block_size(hpvbd->q, bs);
+	blk_queue_physical_block_size(hpvbd->q, bs);
+	blk_queue_max_segments(hpvbd->q, HPVBD_REQ_MAX_SEGMENTS);
+    blk_queue_max_hw_sectors(hpvbd->q, HPVBD_REQ_MAX_SECTORS);
 
 	size = gb * 1024 * 1024 * 1024ULL;
 	sector_div(size, bs);
 	set_capacity(disk, size);
+    hpvbd->size = size;
 
 	disk->flags |= GENHD_FL_EXT_DEVT;
-	disk->major		= null_major;
-	disk->first_minor	= nullb->index;
-	disk->fops		= &null_fops;
-	disk->private_data	= nullb;
-	disk->queue		= nullb->q;
-	sprintf(disk->disk_name, "nullb%d", nullb->index);
+	disk->major		= hpvbd_major;
+	disk->first_minor	= hpvbd->index;
+	disk->fops		= &hpvbd_fops;
+	disk->private_data	= hpvbd;
+	disk->queue		= hpvbd->q;
+	sprintf(disk->disk_name, "hpvbd%d", hpvbd->index);
 	add_disk(disk);
 	return 0;
 
 out_cleanup_blk_queue:
-	blk_cleanup_queue(nullb->q);
+	blk_cleanup_queue(hpvbd->q);
 out_cleanup_tags:
-	if (queue_mode == NULL_Q_MQ)
-		blk_mq_free_tag_set(&nullb->tag_set);
+	if (queue_mode == HPVBD_Q_MQ)
+		blk_mq_free_tag_set(&hpvbd->tag_set);
 out_cleanup_queues:
-	cleanup_queues(nullb);
-out_free_nullb:
-	kfree(nullb);
+	cleanup_queues(hpvbd);
+out_free_hpvbd:
+	kfree(hpvbd);
 out:
 	return rv;
 }
 
-static int null_dev_open(struct inode *inode, struct file *file)
+// TODO: exclusive open only
+static int hpvbd_queue_open(struct inode *inode, struct file *file)
 {
-    int index = NULL_BLK_INDEX(iminor(inode));
-    int queue_idx = NULL_QUEUE_INDEX(iminor(inode));
-    struct nullb *nullb;
-    struct nullb_queue *nq;
+    int index = HPVBD_BLK_INDEX(iminor(inode));
+    int queue_idx = HPVBD_QUEUE_INDEX(iminor(inode));
+    struct hpvbd *hpvbd;
+    struct hpvbd_queue *nq;
     int ret = -ENODEV;
 
 	mutex_lock(&lock);
-    list_for_each_entry(nullb, &nullb_list, list) {
-        if (nullb->index != index)
+    list_for_each_entry(hpvbd, &hpvbd_list, list) {
+        if (hpvbd->index != index)
             continue;
 
-        /* TODO: check nullb kref and inc */
-        file->private_data = nq = &nullb->queues[queue_idx];
+        /* TODO: check hpvbd kref and inc */
+        file->private_data = nq = &hpvbd->queues[queue_idx];
         nq->open_count++;
         ret = 0;
         break;
@@ -808,10 +831,10 @@ static int null_dev_open(struct inode *inode, struct file *file)
     return ret;
 }
 
-static int null_dev_release(struct inode *inode, struct file *file)
+static int hpvbd_queue_release(struct inode *inode, struct file *file)
 {
-    /* TODO: dec nullb->kref */
-    struct nullb_queue *nq = file->private_data;
+    /* TODO: dec hpvbd->kref */
+    struct hpvbd_queue *nq = file->private_data;
     if (--nq->open_count != 0)
         return 0;
 
@@ -819,21 +842,21 @@ static int null_dev_release(struct inode *inode, struct file *file)
 }
 
 
-static long null_handle_user_io_cmd(struct nullb_queue *nq, struct null_user_io __user *ucmd)
+static long hpvbd_ioctl_io_cmd(struct hpvbd_queue *nq, struct hpvbd_ioctl_io __user *ucmd)
 {
-    struct null_user_io cmd;
+    struct hpvbd_ioctl_io cmd;
     struct request *req;
-	struct nullb_cmd *cmnd;
+	struct hpvbd_cmd *cmnd;
 
     if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
         return -EFAULT;
 
-    null_dbg(nq->dev, "receive tag = %d\n", cmd.tag);
+    hpvbd_dbg(nq->dev, "receive tag = %d\n", cmd.tag);
 
     req = blk_mq_tag_to_rq(*nq->tags, cmd.tag);
     cmnd = blk_mq_rq_to_pdu(req);
 
-    if (cmnd->cmd.rw.opcode == null_cmd_read) {
+    if (cmnd->cmd.rw.opcode == hpvbd_cmd_read) {
         copy_from_user_buffer(nq, req, &cmnd->cmd);
     }
 
@@ -841,17 +864,18 @@ static long null_handle_user_io_cmd(struct nullb_queue *nq, struct null_user_io 
     return 0;
 }
 
-static long null_handle_user_admin_cmd(struct nullb_queue *nq, struct null_user_admin __user *ucmd)
+static long hpvbd_ioctl_admin_cmd(struct hpvbd_queue *nq, struct hpvbd_ioctl_admin __user *ucmd)
 {
     int rc = 0;
-    struct null_user_admin cmd;
+    struct hpvbd_ioctl_admin cmd;
 
     if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
         return -EFAULT;
 
     switch (cmd.opcode) {
-    case null_uao_queue_info:
+    case hpvbd_admin_queue_info:
         cmd.queue_info.sa_size = nq->sa->sa_size;
+        cmd.queue_info.disk_sectors = nq->dev->size;
         break;
     default:
         rc = -ENOIOCTLCMD;
@@ -863,52 +887,52 @@ static long null_handle_user_admin_cmd(struct nullb_queue *nq, struct null_user_
     return rc;
 }
 
-static long null_dev_ioctl(struct file *file, unsigned int cmd,
+static long hpvbd_queue_ioctl(struct file *file, unsigned int cmd,
                 unsigned long arg)
 {
-    struct nullb_queue *nq = file->private_data;
+    struct hpvbd_queue *nq = file->private_data;
 
     switch (cmd) {
-    case NULL_IOCTL_IO_CMD:
-        return null_handle_user_io_cmd(nq, (struct null_user_io *)arg);
-    case NULL_IOCTL_ADMIN_CMD:
-        return null_handle_user_admin_cmd(nq, (struct null_user_admin *)arg);
+    case HPVBD_IOCTL_IO_CMD:
+        return hpvbd_ioctl_io_cmd(nq, (struct hpvbd_ioctl_io *)arg);
+    case HPVBD_IOCTL_ADMIN_CMD:
+        return hpvbd_ioctl_admin_cmd(nq, (struct hpvbd_ioctl_admin *)arg);
     default:
         return -ENOTTY;
     }
     return 0;
 }
 
-static void null_vm_open(struct vm_area_struct *vma)
+static void hpvbd_vm_open(struct vm_area_struct *vma)
 {
-    struct nullb_queue *nq = vma->vm_private_data;
-    null_dbg(nq->dev, "vm open\n");
+    struct hpvbd_queue *nq = vma->vm_private_data;
+    hpvbd_info(nq->dev, "vm open\n");
 }
 
-static void null_vm_close(struct vm_area_struct *vma)
+static void hpvbd_vm_close(struct vm_area_struct *vma)
 {
-    struct nullb_queue *nq = vma->vm_private_data;
-    null_dbg(nq->dev, "vm close\n");
+    struct hpvbd_queue *nq = vma->vm_private_data;
+    hpvbd_info(nq->dev, "vm close\n");
 }
 
 
-static struct vm_operations_struct null_vm_ops = {
-    .open   = null_vm_open,
-    .close  = null_vm_close,
+static struct vm_operations_struct hpvbd_vm_ops = {
+    .open   = hpvbd_vm_open,
+    .close  = hpvbd_vm_close,
 };
 
-static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
+static int hpvbd_queue_mmap(struct file *file, struct vm_area_struct *vma)
 {
     unsigned long len = vma->vm_end - vma->vm_start, offset, pfn;
     char *mem;
     struct page *page;
-    struct nullb_queue *nq = file->private_data;
+    struct hpvbd_queue *nq = file->private_data;
 
     mem = (char *)nq->sa;
     len = len > nq->sa->sa_size ? nq->sa->sa_size : len;
 
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
-    vma->vm_ops = &null_vm_ops;
+    vma->vm_ops = &hpvbd_vm_ops;
     vma->vm_private_data = (void *)nq;
 
     for (offset = 0; offset < len; offset += PAGE_SIZE) {
@@ -921,12 +945,13 @@ static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
             return -EAGAIN; // TODO
     }
 
+    hpvbd_vm_open(vma);
     return 0;
 }
 
-static unsigned int null_dev_poll(struct file *file, poll_table *wait)
+static unsigned int hpvbd_queue_poll(struct file *file, poll_table *wait)
 {
-    struct nullb_queue *nq = file->private_data;
+    struct hpvbd_queue *nq = file->private_data;
     unsigned mask = 0;
 
     poll_wait(file, &nq->poll_wait, wait);
@@ -934,30 +959,30 @@ static unsigned int null_dev_poll(struct file *file, poll_table *wait)
     return mask;
 }
 
-static const struct file_operations null_dev_fops = {
+static const struct file_operations hpvbd_queue_fops = {
     .owner      = THIS_MODULE,
-    .open       = null_dev_open,
-    .release    = null_dev_release,
-    .unlocked_ioctl = null_dev_ioctl,
-    .compat_ioctl   = null_dev_ioctl,
-    .mmap       = null_dev_mmap,
-    .poll       = null_dev_poll,
+    .open       = hpvbd_queue_open,
+    .release    = hpvbd_queue_release,
+    .unlocked_ioctl = hpvbd_queue_ioctl,
+    .compat_ioctl   = hpvbd_queue_ioctl,
+    .mmap       = hpvbd_queue_mmap,
+    .poll       = hpvbd_queue_poll,
 };
 
-static int __init null_init(void)
+static int __init hpvbd_init(void)
 {
 	unsigned int i;
     int result;
 
 	if (bs > PAGE_SIZE) {
-		pr_warn("null_blk: invalid block size\n");
-		pr_warn("null_blk: defaults block size to %lu\n", PAGE_SIZE);
+		pr_warn("hpvbd_blk: invalid block size\n");
+		pr_warn("hpvbd_blk: defaults block size to %lu\n", PAGE_SIZE);
 		bs = PAGE_SIZE;
 	}
 
-	if (queue_mode == NULL_Q_MQ && use_per_node_hctx) {
+	if (queue_mode == HPVBD_Q_MQ && use_per_node_hctx) {
 		if (submit_queues < nr_online_nodes) {
-			pr_warn("null_blk: submit_queues param is set to %u.",
+			pr_warn("hpvbd_blk: submit_queues param is set to %u.",
 							nr_online_nodes);
 			submit_queues = nr_online_nodes;
 		}
@@ -974,67 +999,67 @@ static int __init null_init(void)
 
 		init_llist_head(&cq->list);
 
-		if (irqmode != NULL_IRQ_TIMER)
+		if (irqmode != HPVBD_IRQ_TIMER)
 			continue;
 
 		hrtimer_init(&cq->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-		cq->timer.function = null_cmd_timer_expired;
+		cq->timer.function = hpvbd_cmd_timer_expired;
 	}
 
-	null_major = register_blkdev(0, "nullb");
-	if (null_major < 0)
-		return null_major;
+	hpvbd_major = register_blkdev(0, "hpvbd");
+	if (hpvbd_major < 0)
+		return hpvbd_major;
 
-    result = __register_chrdev(null_char_major, 0, NULL_MINORS, "nullb",
-            &null_dev_fops);
+    result = __register_chrdev(hpvbd_char_major, 0, HPVBD_MINORS, "hpvbd",
+            &hpvbd_queue_fops);
     if (result < 0)
         goto unregister_blkdev;
     else if (result > 0)
-        null_char_major = result;
+        hpvbd_char_major = result;
 
-    null_class = class_create(THIS_MODULE, "nullb");
-    if (IS_ERR(null_class)) {
-        result = PTR_ERR(null_class);
+    hpvbd_class = class_create(THIS_MODULE, "hpvbd");
+    if (IS_ERR(hpvbd_class)) {
+        result = PTR_ERR(hpvbd_class);
         goto unregister_chrdev;
     }
 
 	for (i = 0; i < nr_devices; i++) {
-		if (null_add_dev()) {
+		if (hpvbd_add_dev()) {
             result = -EINVAL;
             goto unregister_chrdev;
 		}
 	}
 
-	pr_info("null: module loaded\n");
+	pr_info("hpvbd: module loaded\n");
 	return 0;
 
 unregister_chrdev:
-    __unregister_chrdev(null_char_major, 0, NULL_MINORS, "nullb");
+    __unregister_chrdev(hpvbd_char_major, 0, HPVBD_MINORS, "hpvbd");
 unregister_blkdev:
-	unregister_blkdev(null_major, "nullb");
+	unregister_blkdev(hpvbd_major, "hpvbd");
     return result;
 }
 
-static void __exit null_exit(void)
+static void __exit hpvbd_exit(void)
 {
-	struct nullb *nullb;
+	struct hpvbd *hpvbd;
 
-	unregister_blkdev(null_major, "nullb");
+	unregister_blkdev(hpvbd_major, "hpvbd");
 
 	mutex_lock(&lock);
-	while (!list_empty(&nullb_list)) {
-		nullb = list_entry(nullb_list.next, struct nullb, list);
-		null_del_dev(nullb);
+	while (!list_empty(&hpvbd_list)) {
+		hpvbd = list_entry(hpvbd_list.next, struct hpvbd, list);
+		hpvbd_del_dev(hpvbd);
 	}
 	mutex_unlock(&lock);
 
-    class_destroy(null_class);
-    __unregister_chrdev(null_char_major, 0, NULL_MINORS, "nullb");
-	pr_info("null: module unloaded\n");
+    class_destroy(hpvbd_class);
+    __unregister_chrdev(hpvbd_char_major, 0, HPVBD_MINORS, "hpvbd");
+	pr_info("hpvbd: module unloaded\n");
 }
 
-module_init(null_init);
-module_exit(null_exit);
+module_init(hpvbd_init);
+module_exit(hpvbd_exit);
 
 MODULE_AUTHOR("Jens Axboe <jaxboe@fusionio.com>");
 MODULE_LICENSE("GPL");
