@@ -9,10 +9,12 @@
 #include <linux/blk-mq.h>
 #include <linux/hrtimer.h>
 #include <linux/vmalloc.h>
+#include <linux/poll.h>
 
 #include "shared_data.h"
 
 #define NULL_MINORS     (1U << MINORBITS)
+#define NULL_QUEUE_DEPTH        16
 
 #define NULL_MK_MINOR(nullb_index, queue_index) \
     ((nullb_index) << 8 | (queue_index))
@@ -45,6 +47,7 @@ struct nullb_cmd {
 	struct bio *bio;
 	unsigned int tag;
 	struct nullb_queue *nq;
+    struct null_user_request cmd;
 };
 
 struct nullb_queue {
@@ -59,6 +62,8 @@ struct nullb_queue {
     int open_count;
     struct shared_area *sa;
     struct blk_mq_tags **tags;
+    spinlock_t q_lock;
+    wait_queue_head_t poll_wait;
 };
 
 struct nullb {
@@ -115,7 +120,7 @@ static int queue_mode = NULL_Q_MQ;
 module_param(queue_mode, int, S_IRUGO);
 MODULE_PARM_DESC(queue_mode, "Block interface to use (0=bio,1=rq,2=multiqueue)");
 
-static int gb = 10;
+static int gb = 1;
 module_param(gb, int, S_IRUGO);
 MODULE_PARM_DESC(gb, "Size in GB");
 
@@ -135,7 +140,7 @@ static int completion_nsec = 10000;
 module_param(completion_nsec, int, S_IRUGO);
 MODULE_PARM_DESC(completion_nsec, "Time in ns to complete a request in hardware. Default: 10,000ns");
 
-static int hw_queue_depth = 64;
+static int hw_queue_depth = NULL_QUEUE_DEPTH;
 module_param(hw_queue_depth, int, S_IRUGO);
 MODULE_PARM_DESC(hw_queue_depth, "Queue depth for each hardware queue. Default: 64");
 
@@ -267,26 +272,136 @@ static void null_softirq_done_fn(struct request *rq)
 		end_cmd(rq->special);
 }
 
-static void null_mq_handle_cmd(struct nullb_cmd *cmd)
+static void *alloc_user_buffer(struct shared_area *sa, unsigned int tag, unsigned int len)
 {
-    struct nullb_queue *nq = cmd->nq;
-    null_user_request req;
+    char *buffer;
+    BUG_ON(tag >= NULL_QUEUE_DEPTH);
+    BUG_ON(len > (NULL_REQ_MAX_SECTORS << 9));
 
-    if (nq->sa) {       // TODO
-        req.tag = cmd->rq->tag;
-        null_ring_buffer_enqueue(&nq->sa->sq, &req, 0);
-    }
-	// blk_mq_complete_request(cmd->rq, cmd->rq->errors);
+    buffer = (char *)(sa->buffer + sa->databuf_off + tag * (NULL_REQ_MAX_SECTORS << 9));
+    return buffer;
 }
 
-static inline void null_handle_cmd(struct nullb_cmd *cmd)
+static void copy_to_user_buffer(struct nullb_queue *nq, struct request *req, struct null_user_request *cmnd)
 {
+    struct bio_vec *bvec;
+    struct req_iterator iter;
+    void *src, *dst;
+    unsigned len = 0;
+
+    dst = alloc_user_buffer(nq->sa, req->tag, blk_rq_bytes(req));
+
+    rq_for_each_segment(bvec, req, iter) {
+        src = kmap(bvec->bv_page) + bvec->bv_offset;
+        memcpy(dst + len, src, bvec->bv_len);
+        len += bvec->bv_len;
+        kunmap(bvec->bv_page);
+    }
+
+    cmnd->rw.buf_off = (char *)dst - nq->sa->buffer;
+}
+
+static void copy_from_user_buffer(struct nullb_queue *nq, struct request *req, struct null_user_request *cmnd)
+{
+    struct bio_vec *bvec;
+    struct req_iterator iter;
+    void *src, *dst;
+    unsigned len = 0;
+
+    src = nq->sa->buffer + cmnd->rw.buf_off;
+
+    rq_for_each_segment(bvec, req, iter) {
+        dst = kmap(bvec->bv_page) + bvec->bv_offset;
+        memcpy(dst, src + len, bvec->bv_len);
+        len += bvec->bv_len;
+        kunmap(bvec->bv_page);
+    }
+}
+
+static void null_init_user_cmd(struct nullb_queue *nq, struct nullb_cmd *iod, struct null_user_request *cmnd)
+{
+    struct request *req = iod->rq;
+
+    memset(cmnd, 0, sizeof(*cmnd));
+    cmnd->rw.opcode = (rq_data_dir(req) ? null_cmd_write : null_cmd_read);
+    cmnd->rw.tag = req->tag;
+    cmnd->rw.slba = blk_rq_pos(req);
+    cmnd->rw.length = blk_rq_bytes(req);
+
+    if (req->nr_phys_segments == 0)
+        return;
+    
+    /*
+    {
+        struct bio_vec *bvec;
+        struct req_iterator iter;
+        int i;
+
+        i = 0;
+        rq_for_each_segment(bvec, req, iter) {
+            struct null_iovec *nvec = &cmnd->rw.iovec[i++];
+            nvec->phys_addr = page_to_phys(bvec->bv_page) + bvec->bv_offset;
+            nvec->len = bvec->bv_len;
+
+            if (i >= NULL_REQ_MAX_SEGMENTS) {
+                null_dbg(nq->dev, "request exceeds max segments");
+                break;
+            }
+        }
+        cmnd->rw.nr_iovec = i;
+    }
+    */
+
+    if (cmnd->rw.opcode == null_cmd_write) {
+        copy_to_user_buffer(nq, req, cmnd);
+    } else if (cmnd->rw.opcode == null_cmd_read) {
+        void *dst = alloc_user_buffer(nq->sa, req->tag, blk_rq_bytes(req));
+        cmnd->rw.buf_off = (char *)dst - nq->sa->buffer;
+    }
+}
+
+static inline void notify_user_new_reqeust(struct nullb_queue *nq)
+{
+    wake_up_interruptible(&nq->poll_wait);
+}
+
+static int null_mq_handle_cmd(struct nullb_cmd *cmd)
+{
+    int rc;
+    struct nullb_queue *nq = cmd->nq;
+
+    if (cmd->rq->cmd_flags & REQ_DISCARD) {
+	    blk_mq_complete_request(cmd->rq, 0);
+        return BLK_MQ_RQ_QUEUE_OK;
+    }
+
+    null_init_user_cmd(nq, cmd, &cmd->cmd);
+
+    null_dbg(nq->dev, "enqueue tag = %d, opcode = %d\n", cmd->rq->tag, cmd->cmd.rw.opcode);
+
+    spin_lock_irq(&nq->q_lock);
+    rc = null_ring_buffer_enqueue(&nq->sa->sq, &cmd->cmd, 0);
+    spin_unlock_irq(&nq->q_lock);
+
+    if (rc != 0) {
+        null_dbg(nq->dev, "enqueue failed, queue busy\n");
+        return BLK_MQ_RQ_QUEUE_BUSY;
+    }
+
+    notify_user_new_reqeust(nq);
+    return BLK_MQ_RQ_QUEUE_OK;
+}
+
+static inline int null_handle_cmd(struct nullb_cmd *cmd)
+{
+    int rc = BLK_MQ_RQ_QUEUE_OK;
+
 	/* Complete IO by inline, softirq or timer */
 	switch (irqmode) {
 	case NULL_IRQ_SOFTIRQ:
 		switch (queue_mode)  {
 		case NULL_Q_MQ:
-            null_mq_handle_cmd(cmd);
+            rc = null_mq_handle_cmd(cmd);
 			break;
 		case NULL_Q_RQ:
 			blk_complete_request(cmd->rq);
@@ -306,6 +421,8 @@ static inline void null_handle_cmd(struct nullb_cmd *cmd)
 		null_cmd_end_timer(cmd);
 		break;
 	}
+
+    return rc;
 }
 
 static struct nullb_queue *nullb_to_queue(struct nullb *nullb)
@@ -369,29 +486,31 @@ static int null_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	blk_mq_start_request(bd->rq);
 
-	null_handle_cmd(cmd);
-	return BLK_MQ_RQ_QUEUE_OK;
+	return null_handle_cmd(cmd);
 }
 
 static const struct attribute_group *null_dev_attr_groups[] = {
     NULL,
 };
 
-#define NULL_QUEUE_DEPTH        128
 static struct shared_area *create_shared_data(void)
 {
     unsigned long len;
     struct shared_area *sa;
+    unsigned long ring_buffer_size;
 
-    len = sizeof(struct shared_area) + sizeof(null_user_request) * NULL_QUEUE_DEPTH;
+    ring_buffer_size = null_ring_buffer_size_needed(NULL_QUEUE_DEPTH, sizeof(struct null_user_request));
+
+    len = sizeof(struct shared_area) + ring_buffer_size + (NULL_REQ_MAX_SECTORS << 9) * NULL_QUEUE_DEPTH;
     len = PAGE_ALIGN(len);
 	pr_info("null: shared area len = %lu\n", len);
 
     sa = vmalloc(len);
     BUG_ON(sa == NULL);
-
     sa->sa_size = len;
-    null_ring_buffer_init(&sa->sq, NULL_QUEUE_DEPTH, sizeof(null_user_request), sa->buffer);
+
+    null_ring_buffer_init(&sa->sq, NULL_QUEUE_DEPTH, sizeof(struct null_user_request), sa->buffer);
+    sa->databuf_off = ring_buffer_size;
 
     return sa;
 }
@@ -406,6 +525,8 @@ static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq, unsigne
 
     nq->dev = nullb;
     nq->index = index;
+    spin_lock_init(&nq->q_lock);
+    init_waitqueue_head(&nq->poll_wait);
 
     null_dbg(nq->dev, "vmalloc nq->sa\n");
     nq->sa = create_shared_data();
@@ -634,6 +755,8 @@ static int null_add_dev(void)
 
 	blk_queue_logical_block_size(nullb->q, bs);
 	blk_queue_physical_block_size(nullb->q, bs);
+	blk_queue_max_segments(nullb->q, NULL_REQ_MAX_SEGMENTS);
+    blk_queue_max_hw_sectors(nullb->q, NULL_REQ_MAX_SECTORS);
 
 	size = gb * 1024 * 1024 * 1024ULL;
 	sector_div(size, bs);
@@ -700,15 +823,44 @@ static long null_handle_user_io_cmd(struct nullb_queue *nq, struct null_user_io 
 {
     struct null_user_io cmd;
     struct request *req;
+	struct nullb_cmd *cmnd;
 
     if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
         return -EFAULT;
 
-    null_dbg(nq->dev, "tag = %d\n", cmd.tag);
+    null_dbg(nq->dev, "receive tag = %d\n", cmd.tag);
 
     req = blk_mq_tag_to_rq(*nq->tags, cmd.tag);
+    cmnd = blk_mq_rq_to_pdu(req);
+
+    if (cmnd->cmd.rw.opcode == null_cmd_read) {
+        copy_from_user_buffer(nq, req, &cmnd->cmd);
+    }
+
 	blk_mq_complete_request(req, 0);
     return 0;
+}
+
+static long null_handle_user_admin_cmd(struct nullb_queue *nq, struct null_user_admin __user *ucmd)
+{
+    int rc = 0;
+    struct null_user_admin cmd;
+
+    if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+        return -EFAULT;
+
+    switch (cmd.opcode) {
+    case null_uao_queue_info:
+        cmd.queue_info.sa_size = nq->sa->sa_size;
+        break;
+    default:
+        rc = -ENOIOCTLCMD;
+        break;
+    }
+
+    if (copy_to_user(ucmd, &cmd, sizeof(cmd)))
+        return -EFAULT;
+    return rc;
 }
 
 static long null_dev_ioctl(struct file *file, unsigned int cmd,
@@ -719,6 +871,8 @@ static long null_dev_ioctl(struct file *file, unsigned int cmd,
     switch (cmd) {
     case NULL_IOCTL_IO_CMD:
         return null_handle_user_io_cmd(nq, (struct null_user_io *)arg);
+    case NULL_IOCTL_ADMIN_CMD:
+        return null_handle_user_admin_cmd(nq, (struct null_user_admin *)arg);
     default:
         return -ENOTTY;
     }
@@ -770,6 +924,16 @@ static int null_dev_mmap(struct file *file, struct vm_area_struct *vma)
     return 0;
 }
 
+static unsigned int null_dev_poll(struct file *file, poll_table *wait)
+{
+    struct nullb_queue *nq = file->private_data;
+    unsigned mask = 0;
+
+    poll_wait(file, &nq->poll_wait, wait);
+    mask |= POLLIN | POLLRDNORM;
+    return mask;
+}
+
 static const struct file_operations null_dev_fops = {
     .owner      = THIS_MODULE,
     .open       = null_dev_open,
@@ -777,6 +941,7 @@ static const struct file_operations null_dev_fops = {
     .unlocked_ioctl = null_dev_ioctl,
     .compat_ioctl   = null_dev_ioctl,
     .mmap       = null_dev_mmap,
+    .poll       = null_dev_poll,
 };
 
 static int __init null_init(void)

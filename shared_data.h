@@ -6,6 +6,13 @@
 
 #include <linux/types.h>
 
+#ifndef __KERNEL__
+#define barrier() __asm__ __volatile__("": : :"memory")
+#define smp_mb()    asm volatile("mfence" : : : "memory")
+#define smp_rmb()   barrier()
+#define smp_wmb()   barrier()
+#endif
+
 typedef struct {
         long counter;
 } null_atomic64_t;
@@ -28,21 +35,53 @@ typedef struct {
     long    buf_off;
 } null_ring_buffer;
 
-typedef struct {
-    int     tag;
-} null_user_request;
+
+enum null_opcode {
+    null_cmd_invalid = 0x00,
+    null_cmd_write,
+    null_cmd_read,
+};
+
+#define NULL_REQ_MAX_SEGMENTS   8
+#define NULL_REQ_MAX_SECTORS    128
+
+struct null_iovec {
+    unsigned long   phys_addr;
+    unsigned int    len;
+};
+
+/* request to userspace server */
+struct null_user_request {
+    union {
+        struct {
+            enum null_opcode    opcode;
+            int                 tag;
+            unsigned long       slba;
+            unsigned long       length;
+            unsigned long       buf_off;
+            int                 nr_iovec;
+            struct null_iovec   iovec[NULL_REQ_MAX_SEGMENTS];
+        } rw;
+    };
+};
 
 struct shared_area {
     unsigned long   sa_size;
     null_ring_buffer sq;
+    long            databuf_off;
     char buffer[0];
 };
+
+unsigned long null_ring_buffer_size_needed(long size, long item_size)
+{
+    return (size + 1) * item_size;
+}
 
 void null_ring_buffer_init(null_ring_buffer *rb, long size, long item_size, void *buffer)
 {
     null_atomic64_set(&rb->head, 0);
     null_atomic64_set(&rb->tail, 0);
-    rb->size = size;
+    rb->size = size + 1;
     rb->item_size = item_size;
     rb->buf_off = buffer - (void *)rb;
 }
@@ -72,8 +111,9 @@ int null_ring_buffer_enqueue(null_ring_buffer *rb, void *item, long item_size)
     if (item_size == 0)
         item_size = rb->item_size;
 
-    null_atomic64_set(&rb->tail, next_tail);
     memcpy(null_rb_item(rb, tail), item, item_size);
+    smp_wmb();      // write data before updating rb->tail
+    null_atomic64_set(&rb->tail, next_tail);
     return 0;
 }
 
@@ -89,17 +129,33 @@ int null_ring_buffer_dequeue(null_ring_buffer *rb, void *item, long item_size)
     if (item_size == 0)
         item_size = rb->item_size;
 
+    smp_rmb();      // read rb->tail before read data
     memcpy(item, null_rb_item(rb, head), item_size);
+    smp_mb();       // update rb->head after read data
     null_atomic64_set(&rb->head, next_head);
     return 0;
 }
 
 
 struct null_user_io {
-        __u8    opcode;
-        __u32   tag;
+    __u32   tag;
 };
 
+
+enum null_user_admin_opcode {
+    null_uao_queue_info = 0x01,
+};
+
+struct null_user_admin {
+    __u8    opcode;
+    union {
+        struct {
+            unsigned long sa_size;
+        } queue_info;
+    };
+};
+
+#define NULL_IOCTL_ADMIN_CMD _IOWR('N', 0x42, struct null_user_admin)
 #define NULL_IOCTL_IO_CMD   _IOWR('N', 0x43, struct null_user_io)
 
 #endif
